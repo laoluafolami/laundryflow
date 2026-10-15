@@ -1,0 +1,48 @@
+name: deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment: { type: string, required: true }
+      tag:         { type: string, required: true }
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Naming an environment is what makes GitHub apply that environment's
+    # "required reviewers" rule => the production approval gate lives here.
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.APP_URL }}
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy (blue/green on the VM, no SSH needed)
+        id: deploy
+        run: |
+          OUT=$(az vm run-command invoke -g "${{ vars.AZURE_RG }}" -n "${{ vars.AZURE_VM }}" \
+            --command-id RunShellScript \
+            --scripts "cloud-init status --wait >/dev/null 2>&1 || true; /opt/laundryflow/deploy.sh ${{ inputs.tag }}" \
+            --query "value[0].message" -o tsv)
+          echo "$OUT"
+          echo "$OUT" | grep -q "DEPLOY_OK ${{ inputs.tag }}"
+
+      - name: Smoke test the public URL
+        id: smoke
+        run: ./scripts/smoke.sh "${{ vars.APP_URL }}" "${{ inputs.tag }}"
+
+      - name: Automatic rollback if the new version is unhealthy
+        if: failure() && steps.deploy.outcome == 'success'
+        run: |
+          az vm run-command invoke -g "${{ vars.AZURE_RG }}" -n "${{ vars.AZURE_VM }}" \
+            --command-id RunShellScript --scripts "/opt/laundryflow/rollback.sh" \
+            --query "value[0].message" -o tsv

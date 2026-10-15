@@ -1,0 +1,124 @@
+name: infra (terraform)
+
+on:
+  pull_request:
+    paths: ['infra/**']
+  push:
+    branches: [main]
+    paths: ['infra/**']
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+
+env:
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_admin_ssh_public_key: ${{ secrets.ADMIN_SSH_PUBLIC_KEY }}
+  TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+  TF_VAR_acr_name: ${{ vars.ACR_NAME }}
+  TF_IN_AUTOMATION: 'true'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
+      - name: Format check
+        run: terraform fmt -check -recursive infra
+      - name: Validate every stack (no cloud access needed)
+        run: |
+          for d in infra/shared infra/envs/staging infra/envs/prod; do
+            (cd $d && terraform init -backend=false -input=false >/dev/null && terraform validate)
+          done
+      - name: Security scan of Terraform (Checkov)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra
+          framework: terraform
+          soft_fail: true        # starts as a report; flip to false once you have triaged findings
+          quiet: true
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { stack: shared,       backend: ../backend.hcl }
+          - { stack: envs/staging, backend: ../../backend.hcl }
+          - { stack: envs/prod,    backend: ../../backend.hcl }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Plan ${{ matrix.stack }}
+        working-directory: infra/${{ matrix.stack }}
+        run: |
+          terraform init -input=false -backend-config=${{ matrix.backend }}
+          terraform plan -input=false -no-color | tee plan.txt
+          { echo '### terraform plan: ${{ matrix.stack }}'; echo '```'; tail -n 60 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  apply-shared:
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - working-directory: infra/shared
+        run: terraform init -input=false -backend-config=../backend.hcl && terraform apply -auto-approve -input=false
+
+  apply-staging:
+    needs: apply-shared
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - working-directory: infra/envs/staging
+        run: terraform init -input=false -backend-config=../../backend.hcl && terraform apply -auto-approve -input=false
+
+  apply-production:
+    needs: apply-staging
+    runs-on: ubuntu-latest
+    environment: production   # required reviewers = human approval before prod infra changes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - working-directory: infra/envs/prod
+        run: terraform init -input=false -backend-config=../../backend.hcl && terraform apply -auto-approve -input=false

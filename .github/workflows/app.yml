@@ -1,0 +1,136 @@
+name: app (test, scan, build, deploy)
+
+on:
+  pull_request:
+    paths-ignore: ['infra/**', 'docs/**', 'dr/**']
+  push:
+    branches: [main]
+    paths-ignore: ['infra/**', 'docs/**', 'dr/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a deploy half-way
+
+jobs:
+  # ------------------------------------------------------------ 1. Does it work?
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: laundry, POSTGRES_PASSWORD: laundry, POSTGRES_DB: laundry }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U laundry" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+      - name: Backend tests (real Postgres)
+        working-directory: backend
+        env: { DATABASE_URL: 'postgres://laundry:laundry@localhost:5432/laundry' }
+        run: npm ci && npm test
+      - name: Frontend builds
+        working-directory: frontend
+        run: npm ci && npm run build
+
+  # ------------------------------------------------------------ 2. Is it safe? (DevSecOps "shift left")
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }          # gitleaks scans history, so it needs all commits
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Dependency audit (known-vulnerable npm packages)
+        run: |
+          (cd backend && npm ci --omit=dev && npm audit --omit=dev --audit-level=high)
+          (cd frontend && npm ci --omit=dev && npm audit --omit=dev --audit-level=high)
+      - name: Dockerfile lint (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with: { dockerfile: Dockerfile, failure-threshold: error }
+      - name: Filesystem scan (Trivy: vulnerabilities + secrets)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ------------------------------------------------------------ 3. Build ONE image, scan it, push it
+  build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write       # lets GitHub prove its identity to Azure (OIDC) - no stored password
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Build image
+        run: docker build -t "${{ vars.ACR_NAME }}.azurecr.io/laundryflow:${{ steps.meta.outputs.tag }}" .
+      - name: Scan the image (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ vars.ACR_NAME }}.azurecr.io/laundryflow:${{ steps.meta.outputs.tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: Software bill of materials (SBOM)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ vars.ACR_NAME }}.azurecr.io/laundryflow:${{ steps.meta.outputs.tag }}
+          format: cyclonedx
+          output: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.tag }}
+          path: sbom.cdx.json
+      - name: Push to registry (only reached if the scan passed)
+        run: |
+          az acr login --name "${{ vars.ACR_NAME }}"
+          docker push "${{ vars.ACR_NAME }}.azurecr.io/laundryflow:${{ steps.meta.outputs.tag }}"
+
+  # ------------------------------------------------------------ 4. Staging: automatic
+  deploy-staging:
+    needs: build
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      tag: ${{ needs.build.outputs.tag }}
+    secrets: inherit
+    permissions: { id-token: write, contents: read }
+
+  # ------------------------------------------------------------ 5. Production: waits for a human approval
+  deploy-production:
+    needs: [build, deploy-staging]
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: production
+      tag: ${{ needs.build.outputs.tag }}
+    secrets: inherit
+    permissions: { id-token: write, contents: read }

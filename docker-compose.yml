@@ -1,0 +1,26 @@
+# LOCAL development stack: Postgres + the app in one command:  docker compose up --build
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: laundry
+      POSTGRES_PASSWORD: laundry
+      POSTGRES_DB: laundry
+    ports: ["5434:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U laundry"]
+      interval: 5s
+      retries: 10
+  app:
+    build: .
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://laundry:laundry@db:5432/laundry
+      JWT_SECRET: local-dev-secret-change-me
+      ADMIN_PASSWORD: admin123
+      APP_VERSION: local
+    ports: ["3000:3000"]
+volumes:
+  pgdata:

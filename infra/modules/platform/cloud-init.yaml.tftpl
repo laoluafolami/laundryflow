@@ -1,0 +1,50 @@
+#cloud-config
+# Runs ONCE on first boot of the VM. Installs Docker, Caddy (HTTPS reverse proxy), Azure CLI,
+# and drops the deploy/rollback scripts. The app itself is deployed by the pipeline.
+package_update: true
+package_upgrade: true
+packages:
+  - docker.io
+  - jq
+  - curl
+  - gnupg
+  - ca-certificates
+  - unattended-upgrades
+  - debian-keyring
+  - debian-archive-keyring
+  - apt-transport-https
+write_files:
+  - path: /etc/docker/daemon.json
+    content: |
+      {"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}
+  - path: /opt/laundryflow/config
+    permissions: '0644'
+    content: |
+      ACR_NAME=${acr_name}
+      KV_NAME=${kv_name}
+      APP_NAME=${app_name}
+  - path: /opt/laundryflow/deploy.sh
+    permissions: '0755'
+    encoding: b64
+    content: ${deploy_sh_b64}
+  - path: /opt/laundryflow/rollback.sh
+    permissions: '0755'
+    encoding: b64
+    content: ${rollback_sh_b64}
+  - path: /opt/laundryflow/Caddyfile
+    content: |
+      ${domain} {
+        encode gzip
+        import /etc/caddy/upstream.caddy
+      }
+runcmd:
+  - systemctl enable --now docker
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o /etc/apt/sources.list.d/caddy-stable.list
+  - apt-get update
+  - apt-get install -y caddy
+  - echo 'respond "Service is being deployed" 503' > /etc/caddy/upstream.caddy
+  - cp /opt/laundryflow/Caddyfile /etc/caddy/Caddyfile
+  - systemctl restart caddy
+  - touch /opt/laundryflow/cloud-init-done
