@@ -1,5 +1,5 @@
 # ---- Stage 1: build the React frontend ----
-FROM node:20-alpine AS web
+FROM node:26-alpine AS web
 WORKDIR /web
 COPY frontend/package*.json ./
 RUN npm ci
@@ -7,13 +7,13 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- Stage 2: install only production API dependencies ----
-FROM node:20-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 COPY backend/package*.json ./
 RUN npm ci --omit=dev
 
 # ---- Stage 3: small final image (runs as non-root user) ----
-FROM node:20-alpine
+FROM node:26-alpine
 ENV NODE_ENV=production PORT=3000
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
