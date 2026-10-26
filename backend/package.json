@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "applicationinsights": "^3.4.0",
-    "express": "^4.19.2",
+    "express": "^5.3.0",
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
