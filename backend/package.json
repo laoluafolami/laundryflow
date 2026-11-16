@@ -8,7 +8,7 @@
     "test": "node --test"
   },
   "dependencies": {
-    "applicationinsights": "^3.4.0",
+    "applicationinsights": "^3.17.1",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "helmet": "^7.1.0",
